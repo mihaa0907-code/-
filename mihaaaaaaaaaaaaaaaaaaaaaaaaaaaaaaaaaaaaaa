@@ -1,0 +1,32 @@
+import random
+
+
+class Shifrator:
+
+  def __init__(self, a, b, c):
+    self.__num1 = a
+    self.__num2 = b
+    self.__num3 = c
+    self.__res = 0
+    self.__do_math()
+
+  def __do_math(self):
+    summa = self.__num1 + self.__num2 + self.__num3
+    operation = random.randint(1, 4)
+    rand_num = random.randint(1, 10)
+
+    if operation == 1:
+      self.__res = summa + rand_num
+    elif operation == 2:
+      self.__res = summa - rand_num
+    elif operation == 3:
+      self.__res = summa * rand_num
+    elif operation == 4:
+      self.__res = summa / rand_num
+
+  def __str__(self):
+    return str(self.__res)
+
+
+my_obj = Shifrator(10, 20, 30)
+print(my_obj)
