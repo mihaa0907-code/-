@@ -1,0 +1,22 @@
+class WordLen:
+    def __init__(self, words):
+        self.words = words
+        self.i = 0
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.i < len(self.words):
+            res = len(self.words[self.i])
+            self.i += 1
+            return res
+        else:
+            raise StopIteration
+
+
+slova = ["яблуко", "кіт", "машина", "дім"]
+it = WordLen(slova)
+
+for x in it:
+    print(x)
