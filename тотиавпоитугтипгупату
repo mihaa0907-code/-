@@ -1,0 +1,33 @@
+import requests
+from bs4 import BeautifulSoup
+
+
+class Konverter:
+    def __init__(self, kurs):
+        self.kurs = kurs
+
+    def v_dolary(self, grn):
+        return grn / self.kurs
+
+
+url = "https://bank.gov.ua/ua/markets/exchangerates"
+otvet = requests.get(url)
+
+soup = BeautifulSoup(otvet.text, "html.parser")
+stroki = soup.find_all("tr")
+
+kurs_usd = 0
+
+for s in stroki:
+    if "USD" in s.text:
+        yacheyki = s.find_all("td")
+        kurs_text = yacheyki[4].text.replace(",", ".")
+        kurs_usd = float(kurs_text)
+        break
+
+konv = Konverter(kurs_usd)
+
+grivny = float(input("Введіть суму в гривнях: "))
+rez = konv.v_dolary(grivny)
+
+print("Сума в доларах:", round(rez, 2))
