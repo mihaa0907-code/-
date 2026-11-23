@@ -1,0 +1,396 @@
+"""NEON // Конвертер валют із парсингом сайту НБУ.
+
+Залежності: pip install requests beautifulsoup4
+Інтерфейс — лише стандартний tkinter (Canvas для неонового свічення).
+"""
+import queue
+import re
+import threading
+import tkinter as tk
+from datetime import datetime
+from tkinter import ttk
+
+import requests
+from bs4 import BeautifulSoup
+
+URL = "https://bank.gov.ua/ua/markets/exchangerates"
+CURRENCIES = ("UAH", "USD", "EUR", "PLN", "GBP")
+NAMES = {
+    "UAH": "₴  Українська гривня",
+    "USD": "$  Долар США",
+    "EUR": "€  Євро",
+    "PLN": "zł  Польський злотий",
+    "GBP": "£  Британський фунт",
+}
+HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) NeonConverter/1.0"}
+
+BG, CARD = "#060913", "#0F172A"
+CYAN, PINK = "#00F5D4", "#FF2A85"
+TEXT, MUTED = "#E6EDF7", "#8A97B5"
+SANS, MONO = "Segoe UI", "Consolas"
+WIDTH = 432  # ширина карток
+
+
+# ───────────────────────── Парсинг НБУ ─────────────────────────
+def parse_number(raw: str) -> float:
+    """'41,5000' -> 41.5 (НБУ записує дробову частину через кому)."""
+    return float(raw.replace("\xa0", "").replace(" ", "").replace(",", "."))
+
+
+def fetch_rates() -> dict:
+    """Повертає {код: курс за 1 одиницю в UAH}."""
+    response = requests.get(URL, headers=HEADERS, timeout=10)
+    response.raise_for_status()
+    soup = BeautifulSoup(response.text, "html.parser")
+
+    rates = {"UAH": 1.0}
+    for row in soup.select("table tr"):
+        cells = [td.get_text(strip=True) for td in row.find_all("td")]
+        code = next((c for c in cells if c in CURRENCIES), None)
+        if not code or code == "UAH":
+            continue
+        try:
+            units = int(cells[cells.index(code) + 1])  # «Кількість одиниць»
+            rates[code] = parse_number(cells[-1]) / units  # «Офіційний курс»
+        except (ValueError, IndexError):
+            continue
+
+    missing = set(CURRENCIES) - set(rates)
+    if missing:
+        raise ValueError(f"Не знайдено валюти: {', '.join(sorted(missing))}")
+    return rates
+
+
+# ───────────────────────── Графічні утиліти ─────────────────────────
+def mix(color: str, base: str, share: float) -> str:
+    """Змішує color з base; share — частка color (імітація прозорості)."""
+    a = [int(color[i:i + 2], 16) for i in (1, 3, 5)]
+    b = [int(base[i:i + 2], 16) for i in (1, 3, 5)]
+    return "#%02x%02x%02x" % tuple(int(x * share + y * (1 - share)) for x, y in zip(a, b))
+
+
+def rounded(x1, y1, x2, y2, r):
+    """Точки скругленого прямокутника (малювати з smooth=True)."""
+    r = min(r, (x2 - x1) / 2, (y2 - y1) / 2)
+    return [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r, x2, y2,
+            x2 - r, y2, x1 + r, y2, x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
+
+
+def gradient_line(parent, width, height=3):
+    """Тонка лінія-градієнт від ціану до рожевого."""
+    line = tk.Canvas(parent, width=width, height=height, bg=BG, highlightthickness=0, bd=0)
+    steps = width // 4
+    for i in range(steps):
+        line.create_rectangle(i * 4, 0, i * 4 + 4, height, width=0,
+                              fill=mix(CYAN, PINK, 1 - i / steps))
+    return line
+
+
+class GlowCard(tk.Canvas):
+    """Скруглена картка з неоновою рамкою та м’яким свіченням."""
+    PAD = 10
+
+    def __init__(self, master, accent, height, radius=20):
+        super().__init__(master, width=WIDTH, height=height, bg=BG, highlightthickness=0, bd=0)
+        self.accent, self.h, self.r = accent, height, radius
+        self.inner = tk.Frame(self, bg=CARD)
+        gap = self.PAD + 12
+        self.create_window(WIDTH // 2, height // 2, window=self.inner,
+                           width=WIDTH - 2 * gap, height=height - 2 * (self.PAD + 8))
+        self.draw()
+
+    def draw(self, boost=0.0):
+        self.delete("fx")
+        p = self.PAD
+        pts = rounded(p, p, WIDTH - p, self.h - p, self.r)
+        for width, share in ((11, .08), (7, .16), (4, .30)):
+            self.create_polygon(pts, smooth=True, fill="", width=width, joinstyle="round",
+                                outline=mix(self.accent, BG, min(1, share + boost)), tags="fx")
+        self.create_polygon(pts, smooth=True, fill=CARD, outline=self.accent, width=1.5, tags="fx")
+        self.tag_lower("fx")
+
+
+class NeonButton(tk.Canvas):
+    """Кнопка-«пігулка» з неоновим контуром; при наведенні заливається кольором."""
+
+    def __init__(self, master, text, color, command, width, height, font):
+        super().__init__(master, width=width, height=height, bg=BG, highlightthickness=0,
+                         bd=0, cursor="hand2")
+        self.text, self.color, self.command, self.font = text, color, command, font
+        self.w, self.h = width, height
+        self.hover, self.enabled = False, True
+        self.bind("<Enter>", lambda _: self._set_hover(True))
+        self.bind("<Leave>", lambda _: self._set_hover(False))
+        self.bind("<Button-1>", self._click)
+        self.render()
+
+    def _set_hover(self, value):
+        self.hover = value
+        self.render()
+
+    def _click(self, _):
+        if self.enabled:
+            self.command()
+
+    def set_enabled(self, enabled):
+        self.enabled = enabled
+        self.config(cursor="hand2" if enabled else "arrow")
+        self.render()
+
+    def render(self):
+        self.delete("all")
+        color = self.color if self.enabled else MUTED
+        active = self.hover and self.enabled
+        p = 7
+        pts = rounded(p, p, self.w - p, self.h - p, self.h)
+        rings = ((9, .14), (5, .30)) if active else ((7, .08),)
+        for width, share in rings:
+            self.create_polygon(pts, smooth=True, fill="", outline=mix(color, BG, share),
+                                width=width, joinstyle="round")
+        self.create_polygon(pts, smooth=True, joinstyle="round", width=1.5, outline=color,
+                            fill=color if active else BG)
+        self.create_text(self.w // 2, self.h // 2, text=self.text, font=self.font,
+                         fill=BG if active else color)
+
+    def set_text(self, text):
+        self.text = text
+        self.render()
+
+
+# ───────────────────────── Застосунок ─────────────────────────
+class ConverterApp:
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self.rates: dict = {}
+        self._loading = False
+        self._dot_on = True
+        self._raw_result = ""
+        self._queue: queue.Queue = queue.Queue()
+
+        root.title("NEON // Конвертер валют")
+        root.geometry("480x740")
+        root.configure(bg=BG)
+        root.resizable(False, False)
+
+        self.amount = tk.StringVar(value="100")
+        self.from_cur = tk.StringVar(value="USD")
+        self.to_cur = tk.StringVar(value="UAH")
+        self.result = tk.StringVar(value="—")
+
+        self._setup_styles()
+        self._build_ui()
+
+        for var in (self.amount, self.from_cur, self.to_cur):
+            var.trace_add("write", self._recalculate)
+        self._recalculate()
+
+        self._poll_queue()
+        self.refresh_rates()
+
+    # ── стилі ──
+    def _setup_styles(self):
+        style = ttk.Style()
+        style.theme_use("clam")
+        for name, color in (("Cyan", CYAN), ("Pink", PINK)):
+            style.configure(
+                f"{name}.TCombobox", fieldbackground=BG, background=CARD, foreground=color,
+                arrowcolor=color, bordercolor=mix(color, BG, .6), lightcolor=CARD,
+                darkcolor=CARD, selectbackground=BG, selectforeground=color, padding=8)
+            style.map(
+                f"{name}.TCombobox", fieldbackground=[("readonly", BG)],
+                foreground=[("readonly", color)], selectbackground=[("readonly", BG)],
+                selectforeground=[("readonly", color)],
+                bordercolor=[("focus", color), ("active", color)])
+        opt = self.root.option_add
+        opt("*TCombobox*Listbox.background", CARD)
+        opt("*TCombobox*Listbox.foreground", TEXT)
+        opt("*TCombobox*Listbox.selectBackground", PINK)
+        opt("*TCombobox*Listbox.selectForeground", BG)
+        opt("*TCombobox*Listbox.font", (SANS, 12))
+
+    # ── компоновка ──
+    def _build_ui(self):
+        # Заголовок із неоновим свіченням тексту
+        head = tk.Canvas(self.root, width=WIDTH, height=84, bg=BG, highlightthickness=0, bd=0)
+        cx = WIDTH // 2
+        for off, share in ((4, .06), (3, .10), (2, .18), (1, .30)):
+            for dx, dy in ((-off, 0), (off, 0), (0, -off), (0, off)):
+                head.create_text(cx + dx, 34 + dy, text="NEON", font=(SANS, 32, "bold"),
+                                 fill=mix(CYAN, BG, share))
+        head.create_text(cx, 34, text="NEON", font=(SANS, 32, "bold"), fill=CYAN)
+        head.create_text(cx, 70, text="//  КОНВЕРТЕР ВАЛЮТ  //  КУРС НБУ",
+                         font=(MONO, 10, "bold"), fill=PINK)
+        head.pack(pady=(14, 0))
+        gradient_line(self.root, WIDTH - 40).pack(pady=(4, 8))
+
+        # Верхній блок: «У МЕНЕ Є»
+        self.top = GlowCard(self.root, CYAN, height=158)
+        self.top.pack()
+        self.top_caption = self._card_content(
+            self.top, "У МЕНЕ Є", CYAN, "Cyan.TCombobox", self.from_cur, editable=True)
+
+        # Кнопка обміну
+        self.swap_btn = NeonButton(self.root, "⇅", PINK, self.swap, 74, 74, (SANS, 24, "bold"))
+        self.swap_btn.pack(pady=2)
+
+        # Нижній блок: «Я ОТРИМАЮ»
+        self.bottom = GlowCard(self.root, PINK, height=158)
+        self.bottom.pack()
+        self.bottom_caption = self._card_content(
+            self.bottom, "Я ОТРИМАЮ", PINK, "Pink.TCombobox", self.to_cur, editable=False)
+
+        # Кнопки дій
+        actions = tk.Frame(self.root, bg=BG)
+        actions.pack(pady=(14, 0))
+        self.copy_btn = NeonButton(actions, "Копіювати результат", CYAN, self.copy_result,
+                                   214, 52, (SANS, 11, "bold"))
+        self.copy_btn.pack(side="left")
+        self.refresh_btn = NeonButton(actions, "⟳  Оновити курси", PINK, self.refresh_rates,
+                                      214, 52, (SANS, 11, "bold"))
+        self.refresh_btn.pack(side="left")
+
+        # Сповіщення (місце зарезервоване, щоб вікно не «стрибало»)
+        self.toast = tk.Label(self.root, text="", bg=BG, fg=CYAN, font=(SANS, 12, "bold"))
+        self.toast.pack(pady=(6, 0))
+
+        # Футер
+        footer = tk.Frame(self.root, bg=BG)
+        footer.pack(side="bottom", fill="x", pady=(0, 14))
+        gradient_line(footer, WIDTH - 40, 2).pack(pady=(0, 10))
+        self.rate_label = tk.Label(footer, text="", bg=BG, fg=TEXT, font=(MONO, 13, "bold"))
+        self.rate_label.pack()
+        status = tk.Frame(footer, bg=BG)
+        status.pack(pady=(4, 0))
+        self.dot = tk.Canvas(status, width=12, height=12, bg=BG, highlightthickness=0)
+        self.dot_item = self.dot.create_oval(2, 2, 10, 10, fill=MUTED, width=0)
+        self.dot.pack(side="left", padx=(0, 6))
+        self.status_label = tk.Label(status, text="", bg=BG, fg=MUTED, font=(SANS, 9))
+        self.status_label.pack(side="left")
+
+    def _card_content(self, card, title, accent, combo_style, currency_var, editable):
+        """Наповнює картку: заголовок, число, назва валюти та вибір валюти."""
+        inner = card.inner
+        tk.Label(inner, text=title, bg=CARD, fg=accent,
+                 font=(SANS, 10, "bold")).pack(anchor="w")
+        body = tk.Frame(inner, bg=CARD)
+        body.pack(fill="both", expand=True, pady=(6, 0))
+
+        box = ttk.Combobox(body, textvariable=currency_var, values=CURRENCIES, width=5,
+                           state="readonly", style=combo_style, font=(SANS, 15, "bold"))
+        box.pack(side="right", anchor="n", padx=(10, 0))
+
+        left = tk.Frame(body, bg=CARD)
+        left.pack(side="left", fill="both", expand=True)
+        if editable:
+            vcmd = (self.root.register(self._validate), "%P")
+            entry = tk.Entry(left, textvariable=self.amount, font=(MONO, 30, "bold"), bg=CARD,
+                             fg=accent, insertbackground=accent, relief="flat", bd=0, width=9,
+                             validate="key", validatecommand=vcmd)
+            entry.pack(anchor="w", fill="x")
+            entry.bind("<FocusIn>", lambda _: card.draw(.22))
+            entry.bind("<FocusOut>", lambda _: card.draw())
+            entry.focus_set()
+        else:
+            self.result_label = tk.Label(left, textvariable=self.result, bg=CARD, fg=accent,
+                                         font=(MONO, 30, "bold"), anchor="w")
+            self.result_label.pack(anchor="w", fill="x")
+
+        caption = tk.Label(left, text="", bg=CARD, fg=MUTED, font=(SANS, 10), anchor="w")
+        caption.pack(anchor="w", fill="x")
+        return caption
+
+    # ── логіка ──
+    @staticmethod
+    def _validate(proposed: str) -> bool:
+        return bool(re.fullmatch(r"\d{0,12}[.,]?\d{0,4}", proposed))
+
+    def _pair_rate(self):
+        if not self.rates:
+            return None
+        return self.rates[self.from_cur.get()] / self.rates[self.to_cur.get()]
+
+    def _recalculate(self, *_):
+        self.top_caption.config(text=NAMES[self.from_cur.get()])
+        self.bottom_caption.config(text=NAMES[self.to_cur.get()])
+
+        rate = self._pair_rate()
+        if rate is None:
+            self.result.set("—")
+            self._raw_result = ""
+            return
+        try:
+            amount = float(self.amount.get().replace(",", "."))
+        except ValueError:
+            amount = 0.0
+        value = amount * rate
+        text = f"{value:,.2f}".replace(",", " ")
+        self._raw_result = f"{value:.2f}"
+        self.result.set(text)
+        size = 30 if len(text) <= 10 else 24 if len(text) <= 13 else 18
+        self.result_label.config(font=(MONO, size, "bold"))
+        self.rate_label.config(text=f"1 {self.from_cur.get()} = {rate:.4f} {self.to_cur.get()}")
+
+    def swap(self):
+        src, dst = self.from_cur.get(), self.to_cur.get()
+        self.from_cur.set(dst)
+        self.to_cur.set(src)
+
+    def copy_result(self):
+        if not self._raw_result:
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(self._raw_result)
+        self.toast.config(text="✓ Скопійовано!")
+        self.root.after(1500, lambda: self.toast.config(text=""))
+
+    # ── завантаження курсів у фоновому потоці ──
+    def refresh_rates(self):
+        if self._loading:
+            return
+        self._loading = True
+        self.refresh_btn.set_enabled(False)
+        self.status_label.config(text="Завантаження курсів НБУ…", fg=MUTED)
+        self._blink()
+        threading.Thread(target=self._worker, daemon=True).start()
+
+    def _worker(self):
+        try:
+            self._queue.put(("ok", fetch_rates()))
+        except requests.RequestException:
+            self._queue.put(("error", "Немає з’єднання з сайтом НБУ"))
+        except Exception as exc:  # noqa: BLE001
+            self._queue.put(("error", f"Не вдалося розібрати сторінку: {exc}"))
+
+    def _blink(self):
+        """Пульсація індикатора, поки йде завантаження."""
+        if not self._loading:
+            return
+        self._dot_on = not self._dot_on
+        self.dot.itemconfig(self.dot_item, fill=CYAN if self._dot_on else mix(CYAN, BG, .2))
+        self.root.after(350, self._blink)
+
+    def _poll_queue(self):
+        """Забирає результат потоку в головному потоці (tkinter не потокобезпечний)."""
+        try:
+            kind, payload = self._queue.get_nowait()
+        except queue.Empty:
+            pass
+        else:
+            self._loading = False
+            self.refresh_btn.set_enabled(True)
+            if kind == "ok":
+                self.rates = payload
+                self.dot.itemconfig(self.dot_item, fill=CYAN)
+                self.status_label.config(
+                    text=f"Курси НБУ · оновлено {datetime.now():%H:%M:%S}", fg=MUTED)
+                self._recalculate()
+            else:
+                self.dot.itemconfig(self.dot_item, fill=PINK)
+                self.status_label.config(text=payload, fg=PINK)
+        self.root.after(100, self._poll_queue)
+
+
+if __name__ == "__main__":
+    app_root = tk.Tk()
+    ConverterApp(app_root)
+    app_root.mainloop()
